@@ -1,15 +1,40 @@
 import torch
 import time
+import numpy as np
 from torch import nn
 from torch.nn import init
 from DSC import DSC
+from bg import Bgfuse, BgAttention, BF_Attention
+from PIL import Image
+from scipy.ndimage import distance_transform_edt as bwdist
+from torchvision.utils import save_image
+import os
+import cv2
 # vgg choice
 base = {'dss': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512, 'M', 512, 512, 512, 'M']}
 # extend vgg choice --- follow the paper, you can change it
 extra = {'dss': [(64, 128, 3, [8, 16, 32, 64]), (128, 128, 3, [4, 8, 16, 32]), (256, 256, 5, [8, 16]),
                  (512, 256, 5, [4, 8]), (512, 512, 5, []), (512, 512, 7, [])]}
 connect = {'dss': [[2, 3, 4, 5], [2, 3, 4, 5], [4, 5], [4, 5], [], []]}
+feat_size = [256, 128, 64, 32, 16, 8]
 
+def Bwdist(image, t=8):
+    shape = image.shape[2:]
+    batch_size = image.shape[0]
+    image = image.reshape((-1, shape[0], shape[1], 1))
+    # image = image.squeeze()
+    image2 = image.copy()
+    dist1 = image.copy()
+    dist2 = image.copy()
+    for i in range(batch_size):
+        image[i,:,:,:] = bwdist(np.logical_not(image[i,:,:,:]))
+        image2[i,:,:,:] = bwdist((image2[i,:,:,:]))
+        dist1[i,:,:,:] = 1.0 - ((image[i,:,:,:]<t)*1.0)
+        dist2[i,:,:,:] = 1.0 - ((image2[i,:,:,:]<t)*1.0)
+    dist1 = dist1.reshape((-1, 1, shape[0], shape[1]))
+    dist2 = dist2.reshape((-1, 1, shape[0], shape[1]))
+    
+    return dist1, dist2
 
 # vgg16
 def vgg(cfg, i=3, batch_norm=False):
@@ -57,14 +82,22 @@ class FeatLayer(nn.Module):
         self.main = nn.Sequential(nn.Conv2d(in_channel, channel, k, 1, k // 2), nn.ReLU(inplace=True),
                                   nn.Conv2d(channel, channel, k, 1, k // 2), nn.ReLU(inplace=True)
                                     )
-        self.dsc = DSC(channel)
-        self.last_conv = nn.Conv2d(channel+128, 1, 1, 1)
+        self.last_conv = nn.Conv2d(channel, 1, 1, 1)
 
     def forward(self, x):
-        x = self.main(x)
-        x = self.last_conv(self.dsc(x))
-        return x
+        xx = self.main(x)
+        x = self.last_conv(xx)
+        return x, xx
 
+class BgLayer(nn.Module):
+    def __init__(self, in_channel, channel, k, feat_size):
+        super(BgLayer, self).__init__()
+        self.bg = BF_Attention(channel)
+        self.last_conv = nn.Conv2d(channel, 1, 1, 1)
+    def forward(self, x, bg, fg):
+        x = self.bg(x, bg, fg, normlize=False)
+        x = self.last_conv(x)
+        return x
 
 # fusion features
 class FusionLayer(nn.Module):
@@ -85,51 +118,95 @@ class FusionLayer(nn.Module):
 
 # extra part
 def extra_layer(vgg, cfg):
-    feat_layers, concat_layers, scale = [], [], 1
+    feat_layers, concat_layers, concat_layers2, bg_layers, scale = [], [], [], [], 1
+    feat_size = 256
     for k, v in enumerate(cfg):
         # side output (paper: figure 3)
         feat_layers += [FeatLayer(v[0], v[1], v[2])]
+        bg_layers += [BgLayer(v[0], v[1], v[2], feat_size)]
         # feature map before sigmoid
         concat_layers += [ConcatLayer(v[3], scale, k != 0)]
+        concat_layers2 += [ConcatLayer(v[3], scale, k != 0)]
         scale *= 2
-    return vgg, feat_layers, concat_layers
+        feat_size = feat_size // 2
+    return vgg, feat_layers, concat_layers, bg_layers, concat_layers2
 
 
 # DSS network
 # Note: if you use other backbone network, please change extract
 class DSS(nn.Module):
-    def __init__(self, base, feat_layers, concat_layers, connect, extract=[3, 8, 15, 22, 29], v2=True):
+    def __init__(self, base, feat_layers, concat_layers, bg_layers, concat_layers2, connect, extract=[3, 8, 15, 22, 29], v2=True):
         super(DSS, self).__init__()
         self.extract = extract
         self.connect = connect
         self.base = nn.ModuleList(base)
         self.feat = nn.ModuleList(feat_layers)
+        self.bg_feat = nn.ModuleList(bg_layers)
         self.comb = nn.ModuleList(concat_layers)
+        self.comb2 = nn.ModuleList(concat_layers2)
         self.pool = nn.AvgPool2d(3, 1, 1)
         self.v2 = v2
+        self.select = [1, 2, 3, 6]
         if v2: self.fuse = FusionLayer()
 
-    def forward(self, x, label=None):
-        prob, back, y, num = list(), list(), list(), 0
+    def forward(self, x, bg=None, fg=None, mode='train'):
+        prob, back, y, feats, num = list(), list(), list(), list(), 0
         for k in range(len(self.base)):
             x = self.base[k](x)
             if k in self.extract:
-                y.append(self.feat[num](x))
+                feat0, feat1 = self.feat[num](x)
+                y.append(feat0)
+                feats.append(feat1)
                 num += 1
         # side output
-        y.append(self.feat[num](self.pool(x)))
+        feat0, feat1 = self.feat[num](self.pool(x))
+        y.append(feat0)
+        feats.append(feat1)
+        assert feats[0].size(1) == 128
+        #concat
         for i, k in enumerate(range(len(y))):
             back.append(self.comb[i](y[i], [y[j] for j in self.connect[i]]))
+        #fuse
+        back.append(self.fuse(back))
+        #generate bg
+        for i in back: prob.append(torch.sigmoid(i))
+        if mode=='test':
+            result = torch.mean(torch.cat([prob[i] for i in self.select], dim=1), dim=1, keepdim=True)
+            result = (result > 0.5).float()
+            result = result.detach().cpu().numpy()
+            fork_bg, fork_fg = Bwdist(result)
+            fork_bg = torch.from_numpy(fork_bg).cuda()
+            fork_fg = torch.from_numpy(fork_fg).cuda()
+            assert fork_bg.size(1) == 1
+            # save_image(fork_bg, '/home/hanqi/fork_bg.png', normalize=True)
+            # save_image(fork_fg, '/home/hanqi/fork_fg.png', normalize=True)
+            # fork_bg.error()
+            # assert result
+        
+        yy, back2 = list(), list()
+        #side output
+        for i, f in enumerate(feats):
+            if mode == 'test':
+                yy.append(self.bg_feat[i](f, fork_bg, fork_fg))
+            else:
+                #label = torch.zeros((8, 1, 256, 256)).cuda()
+                yy.append(self.bg_feat[i](f, bg, fg))
+        #concat
+        for i in range(len(yy)):
+            back2.append(self.comb2[i](yy[i], [yy[j] for j in self.connect[i]]))
         # fusion map
         if self.v2:
             # version2: learning fusion
-            back.append(self.fuse(back))
+            back2.append(self.fuse(back2))
         else:
             # version1: mean fusion
-            back.append(torch.cat(back, dim=1).mean(dim=1, keepdim=True))
+            back2.append(torch.cat(back, dim=1).mean(dim=1, keepdim=True))
         # add sigmoid
-        for i in back: prob.append(torch.sigmoid(i))
-        return prob
+        res = list()
+        for i in back2: res.append(torch.sigmoid(i))
+        res.extend(prob)
+        assert len(res) == 14
+        return res
 
 
 # build the whole network
